@@ -19,4 +19,4 @@ Cloudflare-Worker für PPS Books. Liest das Repo **books** aus und baut daraus s
 - `GITHUB_TOKEN` = GitHub-Schlüssel nur für Repo books, „Contents: Read-only“ (als Geheimnis)
 - `ALLOWED_ORIGINS` = https://books.prophotoskills.workers.dev,http://localhost:5173
 
-v1: noch ohne Login. Nächste Stufe: Ausweis aus Web Login + Berechtigung je Buch.
+v2: Variablen bereinigt + Standardwerte (ProPhotoSkills / books / main), klarere Fehlermeldungen. Noch ohne Login. Nächste Stufe: Ausweis aus Web Login + Berechtigung je Buch.

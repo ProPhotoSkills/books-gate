@@ -1,4 +1,7 @@
-// books-gate – Tor und Engine vor dem Repo books (v1)
+// books-gate – Tor und Engine vor dem Repo books (v2)
+// v2 (14.11.): Variablen werden bereinigt (Leerzeichen, „ProPhotoSkills/books“ usw.), feste
+//     Standardwerte ProPhotoSkills / books / main, und Fehlermeldungen zeigen, welches Repo
+//     gefragt wurde und ob ein Schlüssel gesetzt ist (Eric 14.11.: /katalog → HTTP 404).
 // Ablage: Repo books-gate · Brain 1_web/18_books-gate/dateien/books-gate_vN
 //
 // Was die Engine macht:
@@ -107,26 +110,49 @@ function json(data: unknown, status: number, extra: Headers): Response {
   return new Response(JSON.stringify(data, null, 2), { status, headers: h });
 }
 
+// Werte aus Cloudflare bereinigen – fehlt etwas, gelten die festen Standardwerte
+function repo(env: Env): { owner: string; name: string; branch: string } {
+  const clean = (v: string | undefined) => (v ?? "").trim().replace(/^["']|["']$/g, "").trim();
+  let owner = clean(env.GITHUB_OWNER) || "ProPhotoSkills";
+  let name = clean(env.GITHUB_REPO) || "books";
+  // Falls jemand „ProPhotoSkills/books“ oder eine ganze GitHub-Adresse einträgt
+  const voll = name.replace(/^https?:\/\/github\.com\//i, "").replace(/\.git$/i, "").split("/").filter(Boolean);
+  if (voll.length >= 2) {
+    owner = voll[0];
+    name = voll[1];
+  }
+  const branch = clean(env.GITHUB_BRANCH) || "main";
+  return { owner, name, branch };
+}
+
 function ghHeaders(env: Env): Record<string, string> {
   const h: Record<string, string> = { "User-Agent": "prophotoskills-books-gate" };
-  if (env.GITHUB_TOKEN) h.Authorization = `token ${env.GITHUB_TOKEN}`;
+  const token = (env.GITHUB_TOKEN ?? "").trim();
+  if (token) h.Authorization = `token ${token}`;
   return h;
 }
 
 // ---------- GitHub lesen ----------
 
 async function holeBaum(env: Env): Promise<TreeEntry[]> {
-  const branch = env.GITHUB_BRANCH ?? "main";
-  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/git/trees/${branch}?recursive=1`;
+  const r = repo(env);
+  const url = `https://api.github.com/repos/${r.owner}/${r.name}/git/trees/${r.branch}?recursive=1`;
   const res = await fetch(url, { headers: { ...ghHeaders(env), Accept: "application/vnd.github+json" } });
-  if (!res.ok) throw new Error(`GitHub-Dateiliste: HTTP ${res.status}`);
+  if (!res.ok) {
+    const schluessel = (env.GITHUB_TOKEN ?? "").trim() ? "Schlüssel gesetzt" : "kein Schlüssel";
+    let hinweis = "";
+    if (res.status === 404) hinweis = " – Repo/Branch nicht gefunden oder Schlüssel hat keinen Zugriff auf dieses Repo";
+    if (res.status === 401) hinweis = " – Schlüssel ungültig oder abgelaufen";
+    if (res.status === 403) hinweis = " – Abruf-Limit erreicht oder Schlüssel ohne Leserecht";
+    throw new Error(`GitHub-Dateiliste: HTTP ${res.status} für ${r.owner}/${r.name} (Branch ${r.branch}, ${schluessel})${hinweis}`);
+  }
   const data = (await res.json()) as { tree: TreeEntry[] };
   return data.tree;
 }
 
 async function holeDatei(env: Env, pfad: string): Promise<Uint8Array> {
-  const branch = env.GITHUB_BRANCH ?? "main";
-  const url = `https://raw.githubusercontent.com/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/${branch}/${pfad
+  const r = repo(env);
+  const url = `https://raw.githubusercontent.com/${r.owner}/${r.name}/${r.branch}/${pfad
     .split("/")
     .map(encodeURIComponent)
     .join("/")}`;
@@ -284,7 +310,7 @@ export default {
     try {
       if (teile.length === 0) {
         return json(
-          { name: "books-gate", version: 1, adressen: ["/katalog", "/cover/<buch>/<sprache>", "/buch/<buch>/<sprache>", "/pruefung"] },
+          { name: "books-gate", version: 2, adressen: ["/katalog", "/cover/<buch>/<sprache>", "/buch/<buch>/<sprache>", "/pruefung"] },
           200,
           cors,
         );
