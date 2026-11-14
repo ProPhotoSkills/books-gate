@@ -1,4 +1,14 @@
-// books-gate – Tor und Engine vor dem Repo books (v2)
+// books-gate – Tor und Engine vor dem Repo books (v4)
+// v4 (14.11.): Beginner nicht mehr ohne alles, sondern mit kostenlosem Konto (Eric 14.11.: „Idee C mit dem
+//     Konto … ich würde das mit C umsetzen“). Neu KONTO_BUECHER (Standard beginner) = lesbar für jedes
+//     angemeldete Konto; FREIE_BUECHER (ganz ohne Anmeldung) ist jetzt standardmäßig leer.
+// v3 (14.11.): Freischaltung je Buch (Eric 14.11.: „Freischaltung … bau mal los“).
+//     /buch liefert nur noch, wenn das Buch frei ist (seit v4: Beginner mit Konto) oder der angemeldete Nutzer
+//     es gekauft hat. Ausweis = Anmelde-Token aus Supabase „Web Login“ (gleiches Konto wie web),
+//     die App schickt ihn als „Authorization: Bearer …“. Das Tor fragt Supabase mit genau diesem
+//     Token nach public.meine_buecher() – das Tor selbst hat KEINEN Admin-Schlüssel.
+//     Katalog, Cover und Prüfung bleiben ohne Anmeldung (Regal soll alle Bücher zeigen).
+//     Neu: GET /meine → { angemeldet, buecher, frei }.
 // v2 (14.11.): Variablen werden bereinigt (Leerzeichen, „ProPhotoSkills/books“ usw.), feste
 //     Standardwerte ProPhotoSkills / books / main, und Fehlermeldungen zeigen, welches Repo
 //     gefragt wurde und ob ein Schlüssel gesetzt ist (Eric 14.11.: /katalog → HTTP 404).
@@ -20,7 +30,8 @@
 //   GET /katalog                 → JSON: alle Bücher mit Sprachen, Cover- und Buch-Adressen, Warnungen
 //                                  (liest nur die Dateiliste – schnell, 1 Abruf bei GitHub)
 //   GET /cover/<buch>/<sprache>  → Titelbild aus dem EPUB
-//   GET /buch/<buch>/<sprache>   → die EPUB-Datei
+//   GET /buch/<buch>/<sprache>   → die EPUB-Datei (nur frei oder gekauft, sonst 401/403)
+//   GET /meine                   → was der angemeldete Nutzer lesen darf (mit Token)
 //   GET /pruefung                → öffnet ALLE EPUBs und prüft sie (Sprache im EPUB ↔ Ordner, Titelbild,
 //                                  Titel) – für Eric nach dem Hochladen, nicht für die App
 //
@@ -28,8 +39,7 @@
 // zwischen (Cache API wirkt erst mit eigener Domain). Darum öffnet der Katalog die EPUBs
 // nicht, sondern nur die Dateiliste – jede Anfrage bleibt so klein.
 //
-// v1: noch OHNE Login – jeder, der die Adresse kennt, bekommt die Bücher.
-//     Nächste Stufe: Token aus Web Login + Berechtigung je Buch (Supabase „Web Login“).
+// v1/v2: noch ohne Login. Seit v3 mit Freischaltung (siehe oben).
 //
 // Variablen in Cloudflare (Einstellungen → Variablen und Geheimnisse):
 //   GITHUB_OWNER     = ProPhotoSkills
@@ -37,6 +47,11 @@
 //   GITHUB_BRANCH    = main                (optional, Standard main)
 //   GITHUB_TOKEN     = Fine-grained GitHub-Schlüssel, nur Repo books, „Contents: Read-only“ (als Geheimnis!)
 //   ALLOWED_ORIGINS  = https://books.prophotoskills.workers.dev,http://localhost:5173
+//   SUPABASE_URL      = https://rkgjuqdkwaaymkruyhvy.supabase.co   (Projekt „Web Login“, NEU in v3)
+//   SUPABASE_ANON_KEY = der öffentliche „anon“-Schlüssel dieses Projekts (NEU in v3; KEIN service_role!)
+//   KONTO_BUECHER     = beginner        (optional, Standard „beginner“: für jedes angemeldete Konto; mehrere mit Komma)
+//   FREIE_BUECHER     =                 (optional, Standard leer: Bücher ganz ohne Anmeldung)
+// Fehlen SUPABASE_URL/SUPABASE_ANON_KEY, bleiben alle Bücher gesperrt (außer FREIE_BUECHER).
 
 import { unzipSync, strFromU8 } from "fflate";
 
@@ -46,6 +61,10 @@ export interface Env {
   GITHUB_BRANCH?: string;
   GITHUB_TOKEN?: string;
   ALLOWED_ORIGINS?: string;
+  SUPABASE_URL?: string;
+  SUPABASE_ANON_KEY?: string;
+  FREIE_BUECHER?: string;
+  KONTO_BUECHER?: string;
 }
 
 // ---------- Typen ----------
@@ -296,6 +315,56 @@ async function pruefung(env: Env): Promise<unknown> {
   return { stand: new Date().toISOString(), anzahl: ergebnisse.length, warnungen, ergebnisse };
 }
 
+// ---------- Freischaltung (v3) ----------
+
+function liste(roh: string): string[] {
+  return roh.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+}
+
+// ganz ohne Anmeldung (v4: Standard leer)
+export function freieBuecher(env: Env): string[] {
+  return liste(env.FREIE_BUECHER ?? "");
+}
+
+// für jedes angemeldete Konto, auch ohne Kauf (v4: Standard beginner)
+export function kontoBuecher(env: Env): string[] {
+  return liste(env.KONTO_BUECHER === undefined ? "beginner" : env.KONTO_BUECHER);
+}
+
+function tokenAus(request: Request): string | null {
+  const h = request.headers.get("Authorization") ?? "";
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : null;
+}
+
+type Rechte = { angemeldet: boolean; buecher: string[]; fehler?: string };
+
+// Fragt Supabase mit dem Token des Nutzers: public.meine_buecher() → ["nextlevel", …] oder ["*"]
+export async function rechteVon(request: Request, env: Env): Promise<Rechte> {
+  const token = tokenAus(request);
+  if (!token) return { angemeldet: false, buecher: [] };
+  const sbUrl = (env.SUPABASE_URL ?? "").trim().replace(/\/+$/, "");
+  const anon = (env.SUPABASE_ANON_KEY ?? "").trim();
+  if (!sbUrl || !anon) return { angemeldet: false, buecher: [], fehler: "SUPABASE_URL/SUPABASE_ANON_KEY fehlen im Tor" };
+  const res = await fetch(`${sbUrl}/rest/v1/rpc/meine_buecher`, {
+    method: "POST",
+    headers: { apikey: anon, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: "{}",
+  });
+  if (res.status === 401 || res.status === 403) return { angemeldet: false, buecher: [], fehler: "Anmeldung abgelaufen" };
+  if (!res.ok) return { angemeldet: false, buecher: [], fehler: `Supabase HTTP ${res.status}` };
+  const daten = (await res.json()) as unknown;
+  const buecher = Array.isArray(daten) ? daten.map((x) => String(x).toLowerCase()) : [];
+  return { angemeldet: true, buecher };
+}
+
+export function darfLesen(buch: string, rechte: Rechte, frei: string[], konto: string[] = []): boolean {
+  const b = buch.toLowerCase();
+  if (frei.includes(b)) return true;
+  if (!rechte.angemeldet) return false;
+  return konto.includes(b) || rechte.buecher.includes("*") || rechte.buecher.includes(b);
+}
+
 // ---------- Worker ----------
 
 export default {
@@ -310,14 +379,19 @@ export default {
     try {
       if (teile.length === 0) {
         return json(
-          { name: "books-gate", version: 2, adressen: ["/katalog", "/cover/<buch>/<sprache>", "/buch/<buch>/<sprache>", "/pruefung"] },
+          { name: "books-gate", version: 4, adressen: ["/katalog", "/cover/<buch>/<sprache>", "/buch/<buch>/<sprache>", "/meine", "/pruefung"] },
           200,
           cors,
         );
       }
 
       if (teile[0] === "katalog" && teile.length === 1) {
-        return json(baueKatalog(await holeBaum(env)), 200, cors);
+        return json({ ...baueKatalog(await holeBaum(env)), frei: freieBuecher(env), konto: kontoBuecher(env) }, 200, cors);
+      }
+
+      if (teile[0] === "meine" && teile.length === 1) {
+        const r = await rechteVon(request, env);
+        return json({ angemeldet: r.angemeldet, buecher: r.buecher, frei: freieBuecher(env), konto: kontoBuecher(env), ...(r.fehler ? { fehler: r.fehler } : {}) }, 200, cors);
       }
 
       if (teile[0] === "pruefung" && teile.length === 1) {
@@ -326,6 +400,15 @@ export default {
 
       if ((teile[0] === "cover" || teile[0] === "buch") && teile.length === 3) {
         const [art, buch, sprache] = teile;
+        // v3: Buch nur, wenn frei oder gekauft (Cover bleiben frei sichtbar)
+        if (art === "buch") {
+          const r = await rechteVon(request, env);
+          if (!darfLesen(buch, r, freieBuecher(env), kontoBuecher(env))) {
+            return r.angemeldet
+              ? json({ fehler: "Nicht freigeschaltet", buch }, 403, cors)
+              : json({ fehler: "Anmeldung nötig", buch, ...(r.fehler ? { details: r.fehler } : {}) }, 401, cors);
+          }
+        }
         const k = baueKatalog(await holeBaum(env));
         const a = findeAusgabe(k, buch, sprache.toLowerCase());
         if (!a) return json({ fehler: "Nicht gefunden" }, 404, cors);
